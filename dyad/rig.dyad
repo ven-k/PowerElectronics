@@ -1,0 +1,137 @@
+"""
+NASA MOSFET thermal-overstress test circuit with a switching gate.
+
+Supply `V_sup` → load `R_load` → drain; source to ground (low-side switch); gate driven by a PWM command; no heat sink.
+Thermal path: junction → Cauer network → case node → case-to-ambient resistance → ambient.
+Open loop: the rig's case-temperature hysteresis controller is not included.
+Use for short windows (milliseconds); `AveragedRig` covers thermal time scales.
+
+Default values and sources:
+- Channel and junction-to-case ladder: the defaults of `ConductionMOSFET` and `CauerNetwork`, the Stage A set (v)
+  medians of the 12 devices fitted with a two-stage junction.
+- `V_sup` 5.61 V: the supply reading of the steadyState channel. `R_load` 0.2 Ω: with 5.61 V it reproduces the
+  measured on-state power within about 2 % (see `ControlledAveragedRig`).
+- `V_gate` 10 V: a command above `V_th`; only the comparison with `V_th` enters the model.
+- `f_sw` 1 kHz, `duty` 0.4: the rig's gate drive.
+- `R_ca` 58.9 K/W: the IRF520N datasheet R_θJA 62 K/W minus R_θJC 3.1 K/W, free air. It is a
+  datasheet value, not a Stage A fit: Stage A replaced the constant by `CaseToAmbient`, which `StageAModel` and
+  `ControlledAveragedRig` use.
+- `C_case` 5.0 J/K: an order-of-magnitude value, not fitted. Stage A's case node is 1.80 J/K with a 1.05 J/K side
+  node (`StageAModel`).
+- `T_amb` 298.15 K (25 °C).
+"""
+component NASARig
+  supply_level = BlockComponents.Sources.Constant(k = V_sup)
+  supply = ElectricalComponents.Analog.Sources.VoltageSource()
+  load = ElectricalComponents.Analog.Basic.Resistor(R = R_load)
+  mosfet = ConductionMOSFET()
+  ground = ElectricalComponents.Analog.Basic.Ground()
+  gate_drive = PWMSource(amplitude = V_gate, frequency = f_sw, duty = duty)
+  jc = CauerNetwork(T₀ = T_amb)
+  case_node = ThermalComponents.Components.HeatCapacitor(C = C_case, T0 = T_amb)
+  r_ca = ThermalComponents.Components.ThermalResistor(R = R_ca)
+  ambient = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  "Supply voltage (signal, volts; steadyState V_sup ≈ 5.61 V)"
+  parameter V_sup::Real = 5.61
+  "Load resistance"
+  parameter R_load::Resistance = 0.2
+  "Gate command high level (signal, volts)"
+  parameter V_gate::Real = 10.0
+  "Switching frequency"
+  parameter f_sw::Frequency = 1000.0
+  "Gate duty cycle"
+  parameter duty::Real = 0.4
+  "Ambient temperature"
+  parameter T_amb::Temperature = 298.15
+  "Case-to-ambient thermal resistance"
+  parameter R_ca::ThermalResistance = 58.9
+  "Case heat capacity"
+  parameter C_case::HeatCapacity = 5.0
+  "Junction temperature"
+  variable T_j::Temperature
+  "Case (flange) temperature, the measured T_c"
+  variable T_c::Temperature
+relations
+  connect(supply_level.y, supply.V)
+  connect(supply.p, load.p)
+  connect(load.n, mosfet.p)
+  connect(mosfet.n, ground.g)
+  connect(supply.n, ground.g)
+  connect(gate_drive.y, mosfet.gate)
+  connect(mosfet.junction, jc.port_j)
+  connect(jc.port_c, case_node.port, r_ca.port_a)
+  connect(r_ca.port_b, ambient.port)
+  T_j = mosfet.junction.T
+  T_c = case_node.port.T
+end
+
+"""
+Cycle-averaged NASA rig for thermal time scales (seconds to hours).
+
+The device is held on, so the electrical side carries the on-state operating point (V_ds,on, I_d,on, R_ds,on as the
+transient snapshots measure them); `DutyAveragedHeat` passes `duty` × the on-state loss to the thermal network.
+Parameters and thermal path as in `NASARig`.
+"""
+component AveragedRig
+  supply_level = BlockComponents.Sources.Constant(k = V_sup)
+  supply = ElectricalComponents.Analog.Sources.VoltageSource()
+  load = ElectricalComponents.Analog.Basic.Resistor(R = R_load)
+  mosfet = ConductionMOSFET()
+  ground = ElectricalComponents.Analog.Basic.Ground()
+  gate_level = BlockComponents.Sources.Constant(k = V_gate)
+  duty_level = BlockComponents.Sources.Constant(k = duty)
+  averaging = DutyAveragedHeat()
+  jc = CauerNetwork(T₀ = T_amb)
+  case_node = ThermalComponents.Components.HeatCapacitor(C = C_case, T0 = T_amb)
+  r_ca = ThermalComponents.Components.ThermalResistor(R = R_ca)
+  ambient = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  "Supply voltage (signal, volts)"
+  parameter V_sup::Real = 5.61
+  "Load resistance"
+  parameter R_load::Resistance = 0.2
+  "Gate command high level (signal, volts)"
+  parameter V_gate::Real = 10.0
+  "Gate duty cycle"
+  parameter duty::Real = 0.4
+  "Ambient temperature"
+  parameter T_amb::Temperature = 298.15
+  "Case-to-ambient thermal resistance"
+  parameter R_ca::ThermalResistance = 58.9
+  "Case heat capacity"
+  parameter C_case::HeatCapacity = 5.0
+  "Junction temperature"
+  variable T_j::Temperature
+  "Case (flange) temperature, the measured T_c"
+  variable T_c::Temperature
+  "Cycle-averaged dissipated power"
+  variable P_avg::Power
+relations
+  connect(supply_level.y, supply.V)
+  connect(supply.p, load.p)
+  connect(load.n, mosfet.p)
+  connect(mosfet.n, ground.g)
+  connect(supply.n, ground.g)
+  connect(gate_level.y, mosfet.gate)
+  connect(mosfet.junction, averaging.port_device)
+  connect(duty_level.y, averaging.duty)
+  connect(averaging.port_network, jc.port_j)
+  connect(jc.port_c, case_node.port, r_ca.port_a)
+  connect(r_ca.port_b, ambient.port)
+  T_j = mosfet.junction.T
+  T_c = case_node.port.T
+  P_avg = duty * mosfet.P_loss
+end
+
+"Switching rig over 5 gate periods from ambient temperature."
+analysis NASARigSwitching
+  extends TransientAnalysis(stop = 5e-3, dtmax = 1e-6)
+  model = NASARig()
+relations
+end
+
+"Averaged rig warm-up over 600 s from ambient temperature (open loop, 40 % duty)."
+analysis AveragedRigWarmup
+  extends TransientAnalysis(stop = 600)
+  model = AveragedRig()
+relations
+end

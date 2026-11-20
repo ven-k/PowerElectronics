@@ -1,0 +1,177 @@
+"""
+Cauer thermal ladder from junction to case.
+
+`N` nodes: node `k` stores heat in `C_th[k]`; `R_th[k]` connects node `k` to node `k + 1`, and node `N + 1` is `port_c`.
+`port_j` is node 1 (the junction).
+The aging state `a` scales the first stage only: `R_eff[1] = R_th[1] · (1 + a)`, and `R_th[k]` is used as it is for
+`k ≥ 2` (the primary hypothesis: die-attach voiding). The later stages are read as the package's copper tab,
+which has no reason to age. With `N = 1` the single stage is scaled.
+With `aging_input = false` (the default) `a` is a parameter, constant during a simulation. With `aging_input = true`
+the parameter is replaced by the signal input `a_in`, which an `AgingState` can drive.
+
+Default values and sources:
+- `N` 2, `R_th`, `C_th`: the two-stage junction of Stage A parameter set (v). The values are the medians of the stage
+  resistances and capacities over the 12 devices fitted with two stages (tests 22–33).
+  The resistances sum to 10.69 K/W; the IRF520N datasheet maximum R_θJC is 3.1 K/W.
+- `a` 0: pristine. Set (v) estimated a(t) on these devices with the aging on stage 1 only, as this component
+  applies it.
+- `T₀` 298.15 K (25 °C).
+"""
+component CauerNetwork
+  "Number of RC stages, junction to case (T_c alone cannot fix it)"
+  structural parameter N::Integer = 2
+  "Read the aging state from the signal input a_in instead of the parameter a"
+  structural parameter aging_input::Boolean = false
+  "Junction side"
+  port_j = HeatPort()
+  "Case side"
+  port_c = HeatPort()
+  "Aging state as a signal: relative increase of the first stage resistance R_th[1]"
+  a_in = RealInput() if aging_input
+  "Stage thermal resistances, junction to case"
+  parameter R_th::ThermalResistance[N] = [6.634289458535688, 4.058275425543876]
+  "Stage heat capacities, junction to case"
+  parameter C_th::HeatCapacity[N] = [0.03132956205116243, 0.6933552281698974]
+  "Aging state: relative increase of the first stage resistance R_th[1]"
+  parameter a::Real = 0.0 if !aging_input
+  "Initial temperature of all nodes"
+  parameter T₀::Temperature = 298.15
+  "Node temperatures"
+  variable T::Temperature[N]
+  "Heat flow through each stage resistance, towards the case"
+  variable Q::HeatFlowRate[N]
+relations
+  port_j.T = T[1]
+  for k in 1:N
+    initial T[k] = T₀
+  end
+  if N == 1
+    if aging_input
+      Q[1] = (T[1] - port_c.T) / (R_th[1] * (1 + a_in))
+    else
+      Q[1] = (T[1] - port_c.T) / (R_th[1] * (1 + a))
+    end
+  else
+    if aging_input
+      Q[1] = (T[1] - T[2]) / (R_th[1] * (1 + a_in))
+    else
+      Q[1] = (T[1] - T[2]) / (R_th[1] * (1 + a))
+    end
+    for k in 3:N
+      Q[k - 1] = (T[k - 1] - T[k]) / R_th[k - 1]
+    end
+    Q[N] = (T[N] - port_c.T) / R_th[N]
+  end
+  C_th[1] * der(T[1]) = port_j.Q_flow - Q[1]
+  for k in 2:N
+    C_th[k] * der(T[k]) = Q[k - 1] - Q[k]
+  end
+  port_c.Q_flow = -Q[N]
+end
+
+"""
+Cycle-averaged heat transfer for a PWM-driven device.
+
+The device side sees the network temperature; the network receives `duty` × the device's on-state heat.
+Used with a device held permanently on, so the electrical side carries the on-state operating point
+(what the transient snapshots measure) while the thermal side sees the cycle-averaged power.
+`duty` is an input so a controller can switch it (0 while the rig's hysteresis controller holds the gate off).
+"""
+component DutyAveragedHeat
+  "Device side (on-state heat in)"
+  port_device = HeatPort()
+  "Network side (averaged heat out)"
+  port_network = HeatPort()
+  "Fraction of each switching period the device conducts"
+  duty = RealInput()
+relations
+  port_device.T = port_network.T
+  port_network.Q_flow = -duty * port_device.Q_flow
+end
+
+"""
+Case-to-ambient path of an unsinked TO-220: free convection plus radiation.
+
+```math
+\dot{Q} = \underbrace{G_c \, \Delta T \left(\Delta T^2 + \delta^2\right)^{1/8}}_{\text{free convection}}
+        + \underbrace{G_r \, \sigma \left(T_a^4 - T_b^4\right)}_{\text{radiation}},
+\qquad \Delta T = T_a - T_b
+```
+
+In free convection the film coefficient goes as ``\Delta T^{1/4}``, so the heat flow goes as
+``\Delta T^{5/4}``. The `δ` smoothing keeps ``\partial\dot{Q}/\partial\Delta T`` finite at
+``\Delta T = 0``; at `δ = 0.1 K` it is far below any temperature difference the rig sees. The
+second term is Stefan-Boltzmann with the ``G_r \sigma`` convention of
+`ThermalComponents.Components.BodyRadiation`, so `Gr` is emissivity × area × view factor in m²
+and is capped by the package geometry.
+
+This replaces the constant `R_ca` of `NASARig`/`AveragedRig`. A constant cannot cover the
+measured range: on test 36 the case-to-ambient resistance falls from ≈240 K/W at 47 °C to
+≈35 K/W at the 250 °C hold, a factor of 7. In the case-side structure comparison a
+constant `R_ca` misses the held-out cool-downs by a median 12–13 K, this law by 3–4 K.
+
+Defaults come from that comparison: `Gc` is the median of the 12 rig-configuration-1 devices
+in the adopted structure 2N-fixture, a case node plus a fixture side node (range
+0.0082–0.0094; the 6 configuration-2 devices, whose thermocouple reads ≈25 K hot,
+give 0.0079). `Gr` defaults to 0. The fits drive it to zero
+(≤ 1.7e-4 m²), and a parameter-recovery test shows the data cannot separate it from `Gc`:
+with the true `Gr` at 0, refits return up to 7.7e-4 m² while `Gc` falls by 32 %. `Gc` is
+therefore an effective coefficient that includes the radiative loss; set `Gr` only with data
+that separate the two.
+"""
+component CaseToAmbient
+  extends ThermalComponents.Interfaces.Element1D
+  "Free-convection coefficient, W/K^1.25 (effective: it includes radiation while Gr = 0)"
+  parameter Gc::Real = 0.00883
+  "Net radiation conductance (emissivity × area × view factor), m²; not identifiable from the data"
+  parameter Gr::Real = 0.0
+  "Smoothing of the convection law around ΔT = 0"
+  parameter δ::Temperature = 0.1
+  "Stefan-Boltzmann constant (W·m⁻²·K⁻⁴)."
+  final parameter σ::Real(units = "W/(m2.K4)") = 5.670374419e-8
+  "Convective part of the heat flow"
+  variable Q_conv::HeatFlowRate
+  "Radiative part of the heat flow"
+  variable Q_rad::HeatFlowRate
+relations
+  Q_conv = Gc * ΔT * (ΔT ^ 2 + δ ^ 2) ^ 0.125
+  Q_rad = Gr * σ * (port_a.T ^ 4 - port_b.T ^ 4)
+  Q_flow = Q_conv + Q_rad
+end
+
+"""
+Free cool-down of a lumped case through `CaseToAmbient`, for checking the element.
+
+A single heat capacity at 250 °C relaxing to a 32.5 °C ambient with no heat input: the one
+state is the capacitor, and the only path out is the nonlinear element. The point of the test
+is that the apparent time constant must *grow* as the case cools, which is what the measured
+cool-down of test 36 does (183 s at 47 °C against 58 s at 135 °C).
+With convection alone it grows as ΔT^(-1/4), 1.6× between those temperatures; the rest of the
+measured 3.2× is not in a one-node model (the case-side structure comparison adopted a second,
+slow node: structure 2N-fixture).
+"""
+component CaseCooldownTest
+  "Case heat capacity: median one-node fit (structure 1N-conv) of the 12 configuration-1 devices in the case-side structure comparison (burst slopes give 0.77)"
+  parameter C_c::HeatCapacity = 2.69
+  "Initial case temperature"
+  parameter T_start::Temperature = 523.15
+  "Ambient temperature"
+  parameter T_amb::Temperature = 305.65
+  "Radiation coefficient passed to CaseToAmbient (default 0 as fitted; set > 0 only by the radiation unit test)"
+  parameter Gr_ca::Real = 0.0
+  case_node = ThermalComponents.Components.HeatCapacitor(C = C_c, T0 = T_start)
+  to_amb = CaseToAmbient(Gr = Gr_ca)
+  ambient = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  "Case temperature"
+  variable T_c::Temperature
+relations
+  connect(case_node.port, to_amb.port_a)
+  connect(to_amb.port_b, ambient.port)
+  T_c = case_node.port.T
+end
+
+"Free cool-down from 250 °C through the convection + radiation path."
+analysis CaseCooldown
+  extends TransientAnalysis(stop = 1200, abstol = 1e-9, reltol = 1e-9)
+  model = CaseCooldownTest()
+end

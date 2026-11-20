@@ -1,0 +1,231 @@
+"""
+Rig case-temperature hysteresis controller (an external component: Dyad has no event/when
+construct; the implementation in `dyad/case_temperature_controller.jl` samples the case
+temperature with a periodic ModelingToolkit discrete event).
+
+Behaviour: gate ON at T_c ≤ lowTemp(t),
+OFF at T_c ≥ highTemp(t), latched off permanently at T_c ≥ shutdownTemp. The setpoints are a
+piecewise-constant schedule in time (the warm-up staircase advances on a ~65 s dwell —
+time-based, not temperature-triggered), taken from the run's controller log, in KELVIN.
+The schedule enters at construction (like a dataset): `t_sched` holds the step start times,
+`lo_sched`/`hi_sched` the band per step. The gate g and the latch L are held
+constant between samples and updated every `T_sample` seconds; outputs are
+`enable` = g·L (0/1, for NASARig-style drivers) and `duty_out` = duty_on·g·L (for
+`DutyAveragedHeat`). At each sample, T_c ≥ highTemp
+commands off and T_c ≤ lowTemp commands on, so no direction logic is needed.
+
+Default values and sources:
+- Schedule: one step with the band 483.15–485.15 K (210–212 °C). These are test values, the band the unit
+  fixtures `ControllerLatchTest` and `ControllerCycleTest` cross; the rigs pass each test's logged schedule.
+- `shutdownTemp` 623.15 K (350 °C): a test value far above the default band. In the logs it is 10–40 °C above
+  the target, and the rigs pass the logged value.
+- `T_sample` 2.5 s: test 30's controller log, duration per row 2.4816 s, rounded.
+- `duty_on` 0.4: the rig's gate duty.
+"""
+external component CaseTemperatureController
+  "Measured case temperature (drive from a sensor signal)"
+  Tc = RealInput()
+  "Duty command: duty_on while enabled, 0 while gated off"
+  duty_out = RealOutput()
+  "Gate enable (1 conducting bursts allowed, 0 off), latched 0 after shutdown"
+  enable = RealOutput()
+  "Number of schedule steps"
+  structural parameter N::Integer = 1
+  "Schedule step start times (s, simulation clock)"
+  structural parameter t_sched::Real[N] = fill(0.0, N)
+  "Lower hysteresis setpoint per step (K): gate on at or below"
+  structural parameter lo_sched::Real[N] = fill(483.15, N)
+  "Upper hysteresis setpoint per step (K): gate off at or above"
+  structural parameter hi_sched::Real[N] = fill(485.15, N)
+  "Controller sample period (s): the digital loop reads T_c at this cadence (log rows/duration)"
+  structural parameter T_sample::Real = 2.5
+  "Latch-off temperature (K): crossing it disables the gate permanently"
+  parameter shutdownTemp::Temperature = 623.15
+  "Commanded duty while enabled (0–1, DutyAveragedHeat convention)"
+  parameter duty_on::Real = 0.4
+relations
+end
+
+"""
+Closed-loop averaged rig with the Stage A fitted thermal stack and the hysteresis controller:
+the electrical side of `AveragedRig` (device held on; cycle-averaged loss through
+`DutyAveragedHeat`), the one-stage junction (`JunctionStage`) into the 2N-fixture case side
+(a case node and a fixture side node, as in `StageAModel`), a first-order thermocouple-bead lag
+on the measured output (an unmodelled bead lag attenuates the compared ripple), and
+`CaseTemperatureController` closing the loop on the lagged reading.
+
+Fitted parameters are passed per device by the analyses; the defaults below are test 30's
+fitted values. V_sup 5.61 V and R_load 0.2 Ω
+reproduce the measured on-state power (~27.9 W at the fitted hot R_on) within ~2 % — the
+rig's documented operating point and the fitted channel law are mutually consistent.
+"""
+component ControlledAveragedRig
+  "Number of setpoint-schedule steps"
+  structural parameter N::Integer = 5
+  "Schedule step start times (s)"
+  structural parameter t_sched::Real[N] = [0.0, 68.6, 162.6, 227.3, 302.9]
+  "Lower setpoints per step (K)"
+  structural parameter lo_sched::Real[N] = [312.15, 372.15, 422.15, 472.15, 482.15]
+  "Upper setpoints per step (K)"
+  structural parameter hi_sched::Real[N] = [313.15, 373.15, 423.15, 473.15, 483.15]
+  "Controller sample period (s)"
+  structural parameter T_sample::Real = 2.5
+  "Latch-off temperature (K)"
+  parameter shutdownTemp::Temperature = 493.15
+  "Commanded duty while enabled"
+  parameter duty_on::Real = 0.4
+  "Thermocouple-bead lag time constant"
+  parameter tau_sensor::Real(units = "s") = 1.0
+  "Supply voltage (signal, volts; steadyState measures ≈ 5.61 V)"
+  parameter V_sup::Real = 5.61
+  "Load resistance"
+  parameter R_load::Resistance = 0.2
+  "Gate command high level (signal, volts)"
+  parameter V_gate::Real = 10.0
+  "Ambient = run-start temperature (cold start)"
+  parameter T_amb::Temperature = 298.6
+  "Channel resistance at T_ref"
+  parameter R0::Resistance = 0.15813
+  "Linear temperature coefficient"
+  parameter alpha1::LinearTemperatureCoefficient = 0.009812
+  "Quadratic temperature coefficient"
+  parameter alpha2::QuadraticTemperatureCoefficient = 1.71e-5
+  "Junction-to-case thermal resistance"
+  parameter R_jc::ThermalResistance = 4.0431
+  "Die heat capacity"
+  parameter C_die::HeatCapacity = 0.1307
+  "Case node heat capacity"
+  parameter C::HeatCapacity = 1.6959
+  "Free-convection coefficient, W/K^1.25"
+  parameter Gc::Real = 0.0094037
+  "Case-to-side thermal resistance"
+  parameter R_cf::ThermalResistance = 33.188
+  "Side (fixture) node heat capacity"
+  parameter C_f::HeatCapacity = 1.2355
+  supply_level = BlockComponents.Sources.Constant(k = V_sup)
+  supply = ElectricalComponents.Analog.Sources.VoltageSource()
+  load = ElectricalComponents.Analog.Basic.Resistor(R = R_load)
+  mosfet = ConductionMOSFET(R₀ = R0, α₁ = alpha1, α₂ = alpha2)
+  ground = ElectricalComponents.Analog.Basic.Ground()
+  gate_level = BlockComponents.Sources.Constant(k = V_gate)
+  averaging = DutyAveragedHeat()
+  jc = JunctionStage(R_jc = R_jc, C_die = C_die, a = 0.0, T0 = T_amb)
+  case_node = ThermalComponents.Components.HeatCapacitor(C = C, T0 = T_amb)
+  to_amb = CaseToAmbient(Gc = Gc, Gr = 0.0)
+  ambient = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  r_cf = ThermalComponents.Components.ThermalResistor(R = R_cf)
+  side = ThermalComponents.Components.HeatCapacitor(C = C_f, T0 = T_amb)
+  ctl = CaseTemperatureController(N = N, t_sched = t_sched, lo_sched = lo_sched,
+                                  hi_sched = hi_sched, T_sample = T_sample, shutdownTemp = shutdownTemp,
+                                  duty_on = duty_on)
+  "Junction temperature"
+  variable T_j::Temperature
+  "Case (tab) temperature — what the model predicts physically"
+  variable T_c::Temperature
+  "Thermocouple-bead reading: first-order lag of T_c (the signal the controller and the data see)"
+  variable T_c_meas::Temperature
+  "Cycle-averaged dissipated power"
+  variable P_avg::Power
+relations
+  initial T_c_meas = T_amb
+  connect(supply_level.y, supply.V)
+  connect(supply.p, load.p)
+  connect(load.n, mosfet.p)
+  connect(mosfet.n, ground.g)
+  connect(supply.n, ground.g)
+  connect(gate_level.y, mosfet.gate)
+  connect(mosfet.junction, averaging.port_device)
+  connect(averaging.port_network, jc.port_j)
+  connect(jc.port_c, case_node.port)
+  connect(case_node.port, to_amb.port_a)
+  connect(to_amb.port_b, ambient.port)
+  connect(case_node.port, r_cf.port_a)
+  connect(r_cf.port_b, side.port)
+  connect(ctl.duty_out, averaging.duty)
+  der(T_c_meas) = (T_c - T_c_meas) / tau_sensor
+  ctl.Tc = T_c_meas
+  T_j = jc.T_j
+  T_c = case_node.port.T
+  P_avg = ctl.duty_out * mosfet.P_loss
+end
+
+"""
+Unit fixture: the controller alone against a prescribed sine T_c that rises through the band
+and then through shutdownTemp. Expected: enable starts 1, drops at the first upward crossing
+of 485.15 K, the latch fires at 600 K, and enable stays 0 even after T_c falls back below the
+low setpoint — the latch proof.
+"""
+component ControllerLatchTest
+  tc_wave = BlockComponents.Sources.Sine(amplitude = 180.0, frequency = 0.005, offset = 450.0)
+  ctl = CaseTemperatureController(shutdownTemp = 600.0, duty_on = 0.4)
+relations
+  ctl.Tc = tc_wave.y
+end
+
+"""
+Unit fixture: shutdown out of reach, so the gate must re-arm every period — off above
+485.15 K, on again below 483.15 K, indefinitely.
+"""
+component ControllerCycleTest
+  tc_wave = BlockComponents.Sources.Sine(amplitude = 30.0, frequency = 0.005, offset = 470.0)
+  ctl = CaseTemperatureController(shutdownTemp = 1000.0, duty_on = 0.4)
+relations
+  ctl.Tc = tc_wave.y
+end
+
+"Controller latch unit test: sine through band and shutdown (see ControllerLatchTest)."
+analysis ControllerLatch
+  extends TransientAnalysis(stop = 400.0, dtmax = 0.5)
+  model = ControllerLatchTest()
+end
+
+"Controller re-arm unit test: sine cycling through the band only (see ControllerCycleTest)."
+analysis ControllerCycle
+  extends TransientAnalysis(stop = 400.0, dtmax = 0.5)
+  model = ControllerCycleTest()
+end
+
+"""
+Closed loop at test 30's fitted parameters and logged schedule (staircase to a 209–210 °C
+band, shutdown 220 °C, duty 40 %): simulates the full calibration window. Measured yardsticks
+(controller log + s1): 1455 toggles/h, burst period 4.85 s, on-time 2.85 s, hold ripple
+p2–p98 12.83 °C.
+"""
+component Rig30
+  extends ControlledAveragedRig(
+    N = 5, t_sched = [0.0, 68.6, 162.6, 227.3, 302.9],
+    lo_sched = [312.15, 372.15, 422.15, 472.15, 482.15],
+    hi_sched = [313.15, 373.15, 423.15, 473.15, 483.15],
+    T_sample = 2.482, shutdownTemp = 493.15, duty_on = 0.4, tau_sensor = 1.0,
+    T_amb = 298.6,
+    R0 = 0.15813, alpha1 = 0.009812, alpha2 = 1.71e-5,
+    R_jc = 4.0431, C_die = 0.1307,
+    C = 1.6959, Gc = 0.0094037, R_cf = 33.188, C_f = 1.2355)
+end
+
+analysis ControlledRig30
+  extends TransientAnalysis(stop = 1741.0, dtmax = 0.2)
+  model = Rig30()
+end
+
+"""
+Closed loop at test 36's fitted parameters and logged schedule (staircase to a 249–250 °C
+band, shutdown 260 °C). Measured yardsticks (controller log): 2568 toggles/h, burst period
+2.84 s, on-time 1.64 s, hold ripple p2–p98 10.07 °C.
+"""
+component Rig36
+  extends ControlledAveragedRig(
+    N = 5, t_sched = [0.0, 66.4, 131.0, 195.6, 261.9],
+    lo_sched = [312.15, 372.15, 422.15, 472.15, 522.15],
+    hi_sched = [313.15, 373.15, 423.15, 473.15, 523.15],
+    T_sample = 1.408, shutdownTemp = 533.15, duty_on = 0.4, tau_sensor = 1.0,
+    T_amb = 300.3,
+    R0 = 0.14467, alpha1 = 0.006292, alpha2 = 2.381e-5,
+    R_jc = 4.6998, C_die = 0.0631,
+    C = 0.8047, Gc = 0.0077876, R_cf = 11.961, C_f = 1.7035)
+end
+
+analysis ControlledRig36
+  extends TransientAnalysis(stop = 1769.0, dtmax = 0.2)
+  model = Rig36()
+end

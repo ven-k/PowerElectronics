@@ -1,0 +1,73 @@
+"""
+Conduction-only power-MOSFET channel (IRF520N).
+
+Switching edges are not modelled, because the dataset does not resolve them (1–2 µs sampling vs 23 ns datasheet edges).
+Pins: drain `p`, source `n`. `gate` is the gate-source command as a signal in volts. `junction` is the die heat port.
+
+On-state (`gate > V_th`):
+
+```math
+R_{on} = R_0 \left(1 + \alpha_1 \Delta T_j + \alpha_2 \Delta T_j^2\right) + \Delta R,
+\qquad \Delta T_j = T_j - T_{ref}
+```
+
+with `v = R_on · i`. Off-state: `i = G_off · v`.
+All dissipated power `P_loss = v · i` leaves through `junction`.
+The pristine law is the shared Julia function `channel_resistance` in `src/PowerElectronics.jl`:
+the Stage A components and the Stage A fits call the same definition, so the law cannot drift
+between the component and the fits.
+
+Aging: `ΔR` is the direct aging term ΔR_ds,on. With `aging_input = false` (the default)
+it is the parameter `ΔR`, constant during a simulation. With `aging_input = true` the parameter is replaced by the
+signal input `ΔR_in` (Ω), which an `AgingState` can drive.
+
+Default values and sources:
+- `R₀`, `α₁`, `α₂`: medians over the 12 devices of Stage A parameter set (v) that were fitted with a two-stage
+  junction (tests 22–33).
+- `T_ref` 298.15 K (25 °C): the reference temperature of the Stage A channel fits.
+- `ΔR` 0 Ω: pristine.
+- `V_th` 4.0 V: the IRF520N datasheet maximum gate threshold, V_GS(th) 2.0–4.0 V.
+- `G_off` 1e-6 S: a numerical off-state conductance, not fitted. At the rig's 5.61 V it passes 5.6 µA, below the
+  datasheet I_DSS limit of 25 µA.
+"""
+component ConductionMOSFET
+  extends ElectricalComponents.Analog.Interfaces.OnePort
+  "Gate-source voltage command (signal, volts)"
+  gate = RealInput()
+  "Junction (die) heat port"
+  junction = HeatPort()
+  "Read the aging increment from the signal input ΔR_in instead of the parameter ΔR"
+  structural parameter aging_input::Boolean = false
+  "Aging increment of the on-state resistance as a signal (Ω)"
+  ΔR_in = RealInput() if aging_input
+  "On-state resistance at T_ref, pristine"
+  parameter R₀::Resistance = 0.13210477776821447
+  "Reference temperature of R₀"
+  parameter T_ref::Temperature = 298.15
+  "Linear temperature coefficient of the on-state resistance"
+  parameter α₁::LinearTemperatureCoefficient = 0.004971635253450363
+  "Quadratic temperature coefficient of the on-state resistance"
+  parameter α₂::QuadraticTemperatureCoefficient = 3.121126781011276e-5
+  "Aging increment of the on-state resistance (direct ΔR_ds,on term)"
+  parameter ΔR::Resistance = 0.0 if !aging_input
+  "Gate threshold (signal, volts)"
+  parameter V_th::Real = 4.0
+  "Off-state leakage conductance"
+  parameter G_off::Conductance = 1e-6
+  "Junction temperature rise above the reference"
+  variable ΔT_j::Temperature
+  "On-state resistance at the present junction temperature"
+  variable R_on::Resistance
+  "Dissipated power"
+  variable P_loss::Power
+relations
+  ΔT_j = junction.T - T_ref
+  if aging_input
+    R_on = channel_resistance(R₀, α₁, α₂, ΔT_j) + ΔR_in
+  else
+    R_on = channel_resistance(R₀, α₁, α₂, ΔT_j) + ΔR
+  end
+  i = ifelse(gate > V_th, v / R_on, G_off * v)
+  P_loss = v * i
+  junction.Q_flow = -P_loss
+end

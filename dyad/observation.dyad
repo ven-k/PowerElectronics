@@ -1,0 +1,217 @@
+"""
+Zero offset of the drain-current channel: I_d,meas = I_d + offset_I.
+
+A signal block: it reads the modelled current as a `RealInput` and returns the measured reading as a
+`RealOutput`, so it draws no current from the circuit it observes. At the default `offset_I = 0` it is
+transparent. The per-test value is the test's median off-state reading `id_off`; the I_d channel resolves
+16.4 mA per step.
+"""
+component CurrentOffset
+  extends BlockComponents.Interfaces.SISO
+  "Zero offset of the I_d channel (A). Default 0: transparent; per test, the median id_off"
+  parameter offset_I::Current = 0.0
+relations
+  y = u + offset_I
+end
+
+"""
+Step-response artefact of the V_ds channel: V_ds,meas = V_ds + offset_V + e.
+
+At each step of V_ds the error e jumps by `k_V` times the step and then relaxes with time constant `τ_V`.
+The first-order lead–lag form gives exactly this:
+
+```math
+\frac{dx}{dt} = \frac{V_{ds} − x}{τ_V}, \qquad e = k_V (V_{ds} − x), \qquad V_{ds,meas} = V_{ds} + offset_V + e
+```
+
+A pure low-pass is ruled out because the artefact overshoots; for `k_V > 0` this form gives a rise toward
+the final value after turn-on and a decay from above after turn-off, the shapes fitted to the measured V_ds.
+At constant input `x → V_ds`, `e → 0`, so the steady gain is 1.
+The artefact appears in tests 2–18 (2–5 % early-to-late on-state change) and is ≤ 0.7 % in later tests.
+
+Defaults are transparent (`k_V = 0`, `offset_V = 0`), so the block passes V_ds through unchanged until it is
+calibrated. With `τ_V` = 70 µs the block forces µs-scale steps: use it only for intra-pulse simulation,
+where the artefact matters. The filter state starts at the parameter `x_start`; set it to V_ds(0) for an
+error-free start.
+"""
+component VdsStepArtefact
+  extends BlockComponents.Interfaces.SISO
+  "Relaxation time constant (s). 70 µs: test 8, τ_on 69 µs and τ_off 71 µs"
+  parameter τ_V::Time = 70e-6
+  "Overshoot gain: e jumps by k_V × each V_ds step. Default 0: transparent; tests 2–18 show 2–5 % early-to-late change, later tests ≤ 0.7 %"
+  parameter k_V::Real = 0.0
+  "Static offset of the V_ds channel (V). Default 0: transparent; tests 31–33 carry ≈ 0.09 V between the voltage channels (a hypothesis)"
+  parameter offset_V::Voltage = 0.0
+  "Start value of the filter state x (V). Default 0: no effect on the output while k_V = 0; set to V_ds(0) for an error-free start"
+  parameter x_start::Voltage = 0.0
+  "Low-pass follower of the input; the artefact is k_V·(V_ds − x)"
+  variable x::Voltage
+  "Artefact error e = k_V·(V_ds − x)"
+  variable e::Voltage
+relations
+  initial x = x_start
+  der(x) = (u - x) / τ_V
+  e = k_V * (u - x)
+  y = u + offset_V + e
+end
+
+"""
+First-order thermocouple-bead lag of the case temperature: dT_meas/dt = (T_c − T_meas)/τ_tc.
+
+A signal block on the measured output: it reads T_c as a `RealInput` (in K, e.g. from a
+`TemperatureSensor`, which draws no heat), so attaching it leaves the thermal network unchanged. Its zero-
+frequency gain is 1: the mean of T_meas over whole periods of a periodic input equals the mean of T_c.
+For a sine of angular frequency ω the amplitude ratio is 1/√(1 + (ωτ_tc)²) and the phase lag atan(ωτ_tc).
+
+Measurement noise is not part of this block: the ODE stays deterministic, and
+`PowerElectronics.add_measurement_noise` adds seeded Gaussian noise of standard deviation σ_Tc to saved
+samples (src/observation.jl). The reading starts at the parameter `T_start`.
+"""
+component ThermocoupleLag
+  extends BlockComponents.Interfaces.SISO
+  "Bead time constant (s). 1.0 s: tau_sensor of ControlledAveragedRig, a bead time constant of order 1 s"
+  parameter τ_tc::Time = 1.0
+  "Start value of the reading (K). 298.6 K: T_amb of ControlledAveragedRig (test 30's run-start temperature), so the block starts like the rig's inline lag"
+  parameter T_start::Temperature = 298.6
+  "Lagged temperature reading (K)"
+  variable T_meas::Temperature
+relations
+  initial T_meas = T_start
+  der(T_meas) = (u - T_meas) / τ_tc
+  y = T_meas
+end
+
+"""
+Stage A electro-thermal model with the thermocouple-bead lag on its case-temperature output:
+`StageAModel` unchanged, plus `ThermocoupleLag` reading T_c.
+
+```
+StageAModel ── T_c ──▶ ThermocoupleLag(τ_tc = tau_tc, T_start = T_start) ──▶ T_c_meas
+```
+
+The lag is a signal block, so it draws no heat: T_j, T_c and T_f are those of a `StageAModel`
+with the same parameters, and the reading obeys dT_c,meas/dt = (T_c − T_c,meas)/tau_tc from
+T_c,meas(0) = T_start (the start is a parameter). Use it to fit the case side (C, Gc, R_cf, C_f)
+and tau_tc against the measured T_c through T_c_meas, with the junction fixed at Stage A parameter
+set (i); tau_tc → 0 recovers `StageAModel`. On Dyad 3.5 set values through the top-level
+names (`tau_tc`, `C`, …): the subcomponent parameters `lag.τ_tc`, `lag.T_start` are bound to them.
+Pass `PowerElectronics.stageA_tstops(test)` as `tstops` to every solve (see `StageAModel`).
+
+Default values and sources: see `StageAModel`; `tau_tc` below.
+"""
+component StageAModelLag
+  extends StageAModel
+  "Bead time constant (s). 1.0 s: tau_sensor of ControlledAveragedRig, a bead time constant of order 1 s; fitted within 0.01–5 s"
+  parameter tau_tc::Time = 1.0
+  lag = ThermocoupleLag(τ_tc = tau_tc, T_start = T_start)
+  "Thermocouple-bead reading of the case temperature: first-order lag of T_c (the signal the data see)"
+  variable T_c_meas::Temperature
+relations
+  lag.u = T_c
+  T_c_meas = lag.y
+end
+
+"""
+Observation harness: the junction stage driven by the measured case temperature, heated by the circuit's
+own conduction loss during the measured bursts, and observed through the I_d and V_ds channel blocks.
+
+```
+tc_data (s1 T_c) ──▶ case_T ──▶ jc.port_c
+heat_data > 1e-9 ? duty_on·I_d²·R_ds : 0 ──▶ heat ──▶ jc.port_j     jc: JunctionStage(R_jc·(1 + a), C_die)
+T_j ──▶ R_ds ──▶ I_d, V_ds
+I_d  ──▶ CurrentOffset(offset_I)                        ──▶ I_d_meas
+V_ds ──▶ VdsStepArtefact(k_V = 0, offset_V = offset_V)  ──▶ V_ds_meas
+```
+
+- **Case side:** the measured s1 T_c enters as `LinearInterpolation` through a `PrescribedTemperature`,
+  exactly as in `StageAJunction`.
+- **Circuit:** R_ds = `channel_resistance`(R0, alpha1, alpha2, T_j − T_ref) + dR,
+  I_d = V_sup/(R_load + R_ds), V_ds = I_d·R_ds.
+- **Bursts:** on wherever the burst heat series `heat_data` is positive (> 1e-9 W, the switch `StageAModel` uses for
+  `P_off`); the series' own values are not used. During a burst the junction receives
+  Q_in = duty_on·I_d²·R_ds, zero between bursts. Pass `PowerElectronics.stageA_tstops(test)` as `tstops`
+  to every solve.
+- **The outputs are on-state values, while the junction heat is duty-averaged.** I_d, V_ds, I_d_meas and
+  V_ds_meas are what the channels read while the switch conducts at the present T_j (defined at every
+  instant, also between bursts): the quantities the snapshot features `id_on` and `vds_on` estimate. Q_in is
+  the mean over a PWM period, duty_on times the on-state loss.
+- **Observation blocks:** `CurrentOffset` adds offset_I. `VdsStepArtefact` runs with k_V = 0, because the
+  late-window features carry only ≈ 1 mΩ of artefact, so it adds offset_V only. Its filter starts at
+  V_ds(0). Its 70 µs state makes the system stiff, so use a
+  stiff solver (the default `solve` picks one).
+- **Start:** T_j(0) = T_start, the segment's first measured T_c (s1 starts cold, see `StageAModel`).
+
+On Dyad 3.5 set values through the top-level names; the subcomponent parameters are bound to them.
+Data defaults point at test 30.
+"""
+component ObservationHarness
+  "Burst heat step series of the device; only its sign is used, as the burst switch"
+  structural parameter heat_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_heat.csv", independent_var = "time", dependent_vars = ["P"])
+  "Measured case temperature of the same segment (s1 export)"
+  structural parameter tc_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_s1.csv", independent_var = "time", dependent_vars = ["T_c"])
+  "Initial junction temperature (K). 298.596 K: test 30's first s1 row (25.4 °C, assets/stageA/test30_s1.csv), as StageAJunction"
+  parameter T_start::Temperature = 298.596
+  "Junction-to-case thermal resistance, pristine (K/W). 3.1: IRF520N datasheet maximum R_θJC, as StageAJunction"
+  parameter R_jc::ThermalResistance = 3.1
+  "Die-side heat capacity (J/K). 1e-3: a first-pass placeholder, as StageAJunction"
+  parameter C_die::HeatCapacity = 0.001
+  "Aging state: relative increase of R_jc. 0: pristine (Stage A), as StageAJunction"
+  parameter a::Real = 0.0
+  "Channel resistance at T_ref, pristine (Ω). 0.20: the population shows ≈ 0.20 Ω at 25 °C, as StageAJunction"
+  parameter R0::Resistance = 0.20
+  "Linear temperature coefficient of the channel (1/K). 0.0117: population warm-up slope 2.105 mΩ/°C, as StageAJunction"
+  parameter alpha1::LinearTemperatureCoefficient = 0.0117
+  "Quadratic temperature coefficient of the channel (1/K²). 0: no curvature until fitted, as StageAJunction"
+  parameter alpha2::QuadraticTemperatureCoefficient = 0.0
+  "Reference temperature of the channel law (K). 298.15 K (25 °C), where R0 is quoted, as StageAJunction"
+  parameter T_ref::Temperature = 298.15
+  "Aging increment of the channel resistance (Ω). 0: pristine (the ΔR of ConductionMOSFET, dyad/mosfet.dyad)"
+  parameter dR::Resistance = 0.0
+  "Load resistance in series with the channel (Ω). 0.2: R_load of ControlledAveragedRig (dyad/controller.dyad), the rig's operating point"
+  parameter R_load::Resistance = 0.2
+  "Supply voltage (V). 5.61: V_sup of ControlledAveragedRig (dyad/controller.dyad; steadyState measures ≈ 5.61 V)"
+  parameter V_sup::Voltage = 5.61
+  "PWM duty during bursts. 0.4: duty_on of ControlledAveragedRig (dyad/controller.dyad), the rig's operating point"
+  parameter duty_on::Real = 0.4
+  "Zero offset of the I_d channel (A). 0: transparent (CurrentOffset default); per test, the median id_off"
+  parameter offset_I::Current = 0.0
+  "Static offset of the V_ds channel (V). 0: transparent (VdsStepArtefact default)"
+  parameter offset_V::Voltage = 0.0
+  heat_src = BlockComponents.Tables.Interpolation(dataset = heat_data, interpolation_type = BlockComponents.Tables.InterpolationType.ConstantInterpolation())
+  heat = ThermalComponents.Sources.PrescribedHeatFlow()
+  jc = JunctionStage(R_jc = R_jc, C_die = C_die, a = a, T0 = T_start)
+  tc_src = BlockComponents.Tables.Interpolation(dataset = tc_data, interpolation_type = BlockComponents.Tables.InterpolationType.LinearInterpolation())
+  case_T = ThermalComponents.Sources.PrescribedTemperature()
+  id_obs = CurrentOffset(offset_I = offset_I)
+  vds_obs = VdsStepArtefact(k_V = 0.0, offset_V = offset_V, x_start = V_sup * (channel_resistance(R0, alpha1, alpha2, T_start - T_ref) + dR) / (R_load + channel_resistance(R0, alpha1, alpha2, T_start - T_ref) + dR))
+  "Junction temperature"
+  variable T_j::Temperature
+  "On-state channel resistance at the present T_j: pristine law plus dR"
+  variable R_ds::Resistance
+  "On-state drain current"
+  variable I_d::Current
+  "On-state drain-source voltage"
+  variable V_ds::Voltage
+  "Heat into the junction: duty-averaged conduction loss during bursts, zero between"
+  variable Q_in::HeatFlowRate
+  "Measured drain current: I_d through CurrentOffset"
+  variable I_d_meas::Current
+  "Measured drain-source voltage: V_ds through VdsStepArtefact (k_V = 0)"
+  variable V_ds_meas::Voltage
+relations
+  heat_src.u = time
+  tc_src.u = time
+  connect(tc_src.y, case_T.T)
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, case_T.port)
+  T_j = jc.T_j
+  R_ds = channel_resistance(R0, alpha1, alpha2, T_j - T_ref) + dR
+  I_d = V_sup / (R_load + R_ds)
+  V_ds = I_d * R_ds
+  Q_in = ifelse(heat_src.y > 1e-9, duty_on * I_d ^ 2 * R_ds, 0.0)
+  heat.Q_flow = Q_in
+  id_obs.u = I_d
+  I_d_meas = id_obs.y
+  vds_obs.u = V_ds
+  V_ds_meas = vds_obs.y
+end

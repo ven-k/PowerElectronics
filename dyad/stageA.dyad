@@ -1,0 +1,348 @@
+"""
+One junction RC stage between the die heat input and the case.
+
+`C_die·der(T_j) = Q_in − Q`, `Q = (T_j − port_c.T)/(R_jc·(1 + a))`: the scalar twin of
+`CauerNetwork(N = 1)`, written with scalar parameters because array elements in a calibration
+search space are unverified. The aging state `a` scales the resistance,
+R_eff = R_jc·(1 + a) — the primary Stage A hypothesis, die-attach voiding. `a` stays 0 while
+Stage A fits pristine parameters. Sign conventions mirror `CauerNetwork` (heat positive into both ports).
+With `aging_input = false` (the default) `a` is a parameter, constant during a simulation. With
+`aging_input = true` the parameter is replaced by the signal input `a_in`, which an `AgingState`
+can drive.
+
+Default values and sources:
+- `R_jc` 3.1 K/W: the IRF520N datasheet maximum R_θJC.
+- `C_die` 1e-3 J/K: a first-pass placeholder. A bare die is 2–5 mJ/K; the within-burst
+  R rise implies 0.03–0.3 J/K (an inference) — Stage A fits it from R_meas, because T_c
+  cannot fix it.
+"""
+component JunctionStage
+  "Die side (heat input)"
+  port_j = HeatPort()
+  "Case side"
+  port_c = HeatPort()
+  "Read the aging state from the signal input a_in instead of the parameter a"
+  structural parameter aging_input::Boolean = false
+  "Aging state as a signal: relative increase of R_jc"
+  a_in = RealInput() if aging_input
+  "Junction-to-case thermal resistance, pristine"
+  parameter R_jc::ThermalResistance = 3.1
+  "Die-side heat capacity"
+  parameter C_die::HeatCapacity = 0.001
+  "Aging state: relative increase of R_jc"
+  parameter a::Real = 0.0 if !aging_input
+  "Initial junction temperature"
+  parameter T0::Temperature = 298.15
+  "Junction temperature"
+  variable T_j::Temperature
+  "Heat flow through the stage resistance, towards the case"
+  variable Q::HeatFlowRate
+relations
+  initial T_j = T0
+  port_j.T = T_j
+  if aging_input
+    Q = (T_j - port_c.T) / (R_jc * (1 + a_in))
+  else
+    Q = (T_j - port_c.T) / (R_jc * (1 + a))
+  end
+  C_die * der(T_j) = port_j.Q_flow - Q
+  port_c.Q_flow = -Q
+end
+
+"""
+Stage A electro-thermal model of one device: the measured burst heat drives one junction
+stage into the case side of structure 2N-fixture (a case node and a fixture side node), and
+the channel law at T_j gives R_model.
+
+```
+P(t) ─▶ junction T_j (C_die) ──R_jc·(1 + a)──▶ case T_c (C) ──CaseToAmbient(Gc, Gr = 0)──▶ T_amb
+                                                  │
+                                                 R_cf ──▶ side node T_f (C_f), no other path
+```
+
+- **Heat input:** `Interpolation` of the device's `test<N>_heat.csv` with ConstantInterpolation —
+  the step series is the square wave of the controller-log bursts, exact between
+  edges. Pass `PowerElectronics.stageA_tstops(test)` as `tstops` to every solve: the
+  interpolant is discontinuous at each edge and bursts can be 35 ms apart.
+- **`P_off`:** constant off-state heat between bursts, 0 by default. The `p_off` variant of
+  the Stage A case-side fit frees it for tests 31–33. Off-state conduction dissipates in the
+  die, so it enters the junction.
+- **Initial conditions:** every node starts at `T_start`, the segment's first measured T_c —
+  also the junction: s1 starts cold with its first burst at t ≥ 0, where T_j = T_c exactly.
+- **`E_amb`** integrates the ambient-path heat for the energy-balance acceptance check in
+  `test/stageA_model.jl`; nothing feeds back on it.
+
+Default values and sources:
+- Case side `C`, `Gc`, `R_cf`, `C_f`: medians of the 12 rig-configuration-1 devices in the
+  case-side structure comparison, structure 2N-fixture. Configuration-2 fits start from their
+  own medians.
+- `R0` 0.20 Ω at `T_ref` 298.15 K: the population shows ≈0.20 Ω at 25 °C.
+- `alpha1` 0.0117 /K: the population warm-up slope 2.105 mΩ/°C.
+  `alpha2` 0: no curvature until fitted (the fit allows either sign).
+- `T_start` = `T_amb` = 298.596 K: test 30's first s1 row (25.4 °C, `assets/stageA/
+  test30_s1.csv`); both are set per device.
+"""
+component StageAModel
+  "Burst heat step series of the device"
+  structural parameter heat_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_heat.csv", independent_var = "time", dependent_vars = ["P"])
+  "Initial temperature of every node: the segment's first measured T_c"
+  parameter T_start::Temperature = 298.596
+  "Ambient temperature: the first T_c of s1 when the device starts cold"
+  parameter T_amb::Temperature = 298.596
+  "Junction-to-case thermal resistance, pristine"
+  parameter R_jc::ThermalResistance = 3.1
+  "Die-side heat capacity"
+  parameter C_die::HeatCapacity = 0.001
+  "Aging state: relative increase of R_jc (0 in Stage A)"
+  parameter a::Real = 0.0
+  "Measured case node heat capacity"
+  parameter C::HeatCapacity = 1.80
+  "Free-convection coefficient of the case-to-ambient path, W/K^1.25"
+  parameter Gc::Real = 0.00883
+  "Case-to-side-node thermal resistance"
+  parameter R_cf::ThermalResistance = 37.9
+  "Side (fixture) node heat capacity"
+  parameter C_f::HeatCapacity = 1.05
+  "Channel resistance at T_ref, pristine"
+  parameter R0::Resistance = 0.20
+  "Linear temperature coefficient of the channel"
+  parameter alpha1::LinearTemperatureCoefficient = 0.0117
+  "Quadratic temperature coefficient of the channel"
+  parameter alpha2::QuadraticTemperatureCoefficient = 0.0
+  "Reference temperature of the channel law"
+  parameter T_ref::Temperature = 298.15
+  "Constant off-state heat between bursts (freed for tests 31–33)"
+  parameter P_off::Power = 0.0
+  "Initial side-node temperature: T_start in s1 (cold start); fitted per segment in cool-down scoring, where the side node's start is unknown"
+  parameter T_f_start::Temperature = T_start
+  heat_src = BlockComponents.Tables.Interpolation(dataset = heat_data, interpolation_type = BlockComponents.Tables.InterpolationType.ConstantInterpolation())
+  heat = ThermalComponents.Sources.PrescribedHeatFlow()
+  jc = JunctionStage(R_jc = R_jc, C_die = C_die, a = a, T0 = T_start)
+  case_node = ThermalComponents.Components.HeatCapacitor(C = C, T0 = T_start)
+  to_amb = CaseToAmbient(Gc = Gc, Gr = 0.0)
+  ambient = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  r_cf = ThermalComponents.Components.ThermalResistor(R = R_cf)
+  side = ThermalComponents.Components.HeatCapacitor(C = C_f, T0 = T_f_start)
+  "Junction temperature"
+  variable T_j::Temperature
+  "Case (measured node) temperature"
+  variable T_c::Temperature
+  "Side (fixture) node temperature"
+  variable T_f::Temperature
+  "Channel resistance at the present T_j, pristine law"
+  variable R_model::Resistance
+  "Heat flow through the case-to-ambient path"
+  variable Q_amb::HeatFlowRate
+  "Integrated ambient-path heat, for the energy-balance check"
+  variable E_amb::Real(units = "J")
+relations
+  initial E_amb = 0.0
+  heat_src.u = time
+  heat.Q_flow = ifelse(heat_src.y > 1e-9, heat_src.y, P_off)
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, case_node.port)
+  connect(case_node.port, to_amb.port_a)
+  connect(to_amb.port_b, ambient.port)
+  connect(case_node.port, r_cf.port_a)
+  connect(r_cf.port_b, side.port)
+  der(E_amb) = Q_amb
+  T_j = jc.T_j
+  T_c = case_node.port.T
+  T_f = side.port.T
+  Q_amb = to_amb.Q_flow
+  R_model = channel_resistance(R0, alpha1, alpha2, T_j - T_ref)
+end
+
+"""
+Junction stage and channel law alone, the case side pinned to the measured T_c. The Stage A
+fits to the measured resistance R_meas run this model, so the junction/channel fit is
+independent of the case-side model: a wrong case parameter cannot leak into R0, alpha1, alpha2, R_jc or C_die.
+
+The measured T_c enters as `LinearInterpolation` of the s1 export — a sampled continuous
+signal — while the heat is the burst step series with ConstantInterpolation — an
+event-timed square wave. Pass `PowerElectronics.stageA_tstops(test)` to every solve.
+Parameter defaults and sources: see `StageAModel`; data defaults point at test 30.
+"""
+component StageAJunction
+  "Burst heat step series of the device"
+  structural parameter heat_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_heat.csv", independent_var = "time", dependent_vars = ["P"])
+  "Measured case temperature of the same segment (s1 export)"
+  structural parameter tc_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_s1.csv", independent_var = "time", dependent_vars = ["T_c"])
+  "Initial junction temperature: the segment's first measured T_c"
+  parameter T_start::Temperature = 298.596
+  "Junction-to-case thermal resistance, pristine"
+  parameter R_jc::ThermalResistance = 3.1
+  "Die-side heat capacity"
+  parameter C_die::HeatCapacity = 0.001
+  "Aging state: relative increase of R_jc (0 in Stage A)"
+  parameter a::Real = 0.0
+  "Channel resistance at T_ref, pristine"
+  parameter R0::Resistance = 0.20
+  "Linear temperature coefficient of the channel"
+  parameter alpha1::LinearTemperatureCoefficient = 0.0117
+  "Quadratic temperature coefficient of the channel"
+  parameter alpha2::QuadraticTemperatureCoefficient = 0.0
+  "Reference temperature of the channel law"
+  parameter T_ref::Temperature = 298.15
+  heat_src = BlockComponents.Tables.Interpolation(dataset = heat_data, interpolation_type = BlockComponents.Tables.InterpolationType.ConstantInterpolation())
+  heat = ThermalComponents.Sources.PrescribedHeatFlow()
+  jc = JunctionStage(R_jc = R_jc, C_die = C_die, a = a, T0 = T_start)
+  tc_src = BlockComponents.Tables.Interpolation(dataset = tc_data, interpolation_type = BlockComponents.Tables.InterpolationType.LinearInterpolation())
+  case_T = ThermalComponents.Sources.PrescribedTemperature()
+  "Junction temperature"
+  variable T_j::Temperature
+  "Channel resistance at the present T_j, pristine law"
+  variable R_model::Resistance
+relations
+  heat_src.u = time
+  tc_src.u = time
+  connect(heat_src.y, heat.Q_flow)
+  connect(tc_src.y, case_T.T)
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, case_T.port)
+  T_j = jc.T_j
+  R_model = channel_resistance(R0, alpha1, alpha2, T_j - T_ref)
+end
+
+"""
+Two junction RC stages against the measured T_c: the `two_stage` variant of the Stage A junction
+fit, prompted by the rise of R within each burst. Heat enters stage 1 (the die, where R_model is
+evaluated); stage 2 sits between it and the pinned case. Scored against the one-stage
+`StageAJunction` on held-out R snapshots binned by time into the burst (`t_burst`), never by an
+information criterion.
+The aging state `a` scales stage 1 only: R_jc1·(1 + a) joins the die to stage 2, and R_jc2 joins
+stage 2 to the case as it is, as in `CauerNetwork`. With constant heat P and a constant case
+temperature the die settles P·(R_jc1·(1 + a) + R_jc2) above the case and stage 2 settles
+P·R_jc2 above it; `test/stageA_model.jl` checks both.
+Defaults and sources: see `StageAModel`; the two stages split the datasheet R_θJC evenly and
+the die/package heat capacities by an order of magnitude.
+"""
+component StageAJunction2
+  "Burst heat step series of the device"
+  structural parameter heat_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_heat.csv", independent_var = "time", dependent_vars = ["P"])
+  "Measured case temperature of the same segment (s1 export)"
+  structural parameter tc_data::DyadData.DyadTimeseries = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_s1.csv", independent_var = "time", dependent_vars = ["T_c"])
+  "Initial temperature of both stages: the segment's first measured T_c"
+  parameter T_start::Temperature = 298.596
+  "Stage-1 (die) thermal resistance"
+  parameter R_jc1::ThermalResistance = 1.55
+  "Stage-1 (die) heat capacity"
+  parameter C_die1::HeatCapacity = 0.01
+  "Stage-2 (package) thermal resistance"
+  parameter R_jc2::ThermalResistance = 1.55
+  "Stage-2 (package) heat capacity"
+  parameter C_die2::HeatCapacity = 0.1
+  "Aging state: relative increase of the stage-1 resistance R_jc1 (0 in Stage A)"
+  parameter a::Real = 0.0
+  "Channel resistance at T_ref, pristine"
+  parameter R0::Resistance = 0.20
+  "Linear temperature coefficient of the channel"
+  parameter alpha1::LinearTemperatureCoefficient = 0.0117
+  "Quadratic temperature coefficient of the channel"
+  parameter alpha2::QuadraticTemperatureCoefficient = 0.0
+  "Reference temperature of the channel law"
+  parameter T_ref::Temperature = 298.15
+  heat_src = BlockComponents.Tables.Interpolation(dataset = heat_data, interpolation_type = BlockComponents.Tables.InterpolationType.ConstantInterpolation())
+  heat = ThermalComponents.Sources.PrescribedHeatFlow()
+  jc1 = JunctionStage(R_jc = R_jc1, C_die = C_die1, a = a, T0 = T_start)
+  jc2 = JunctionStage(R_jc = R_jc2, C_die = C_die2, T0 = T_start)
+  tc_src = BlockComponents.Tables.Interpolation(dataset = tc_data, interpolation_type = BlockComponents.Tables.InterpolationType.LinearInterpolation())
+  case_T = ThermalComponents.Sources.PrescribedTemperature()
+  "Die temperature (stage 1)"
+  variable T_j::Temperature
+  "Channel resistance at the present T_j, pristine law"
+  variable R_model::Resistance
+relations
+  heat_src.u = time
+  tc_src.u = time
+  connect(heat_src.y, heat.Q_flow)
+  connect(tc_src.y, case_T.T)
+  connect(heat.port, jc1.port_j)
+  connect(jc1.port_c, jc2.port_j)
+  connect(jc2.port_c, case_T.port)
+  T_j = jc1.T_j
+  R_model = channel_resistance(R0, alpha1, alpha2, T_j - T_ref)
+end
+
+"""
+Unit fixture for `JunctionStage`: constant heat in, case side pinned. The steady state is the hand
+calculation
+
+```math
+T_j(∞) = T_{case} + P_{in} · R_{jc} · (1 + a_{net})
+```
+
+0.5 s ≈ 160 junction time constants at the defaults (τ_j = R_jc·C_die ≈ 3.1 ms), so the end
+of the run is steady to solver tolerance. `test/stageA_model.jl` runs the analysis at
+`a_net` = 0 and rebuilds the fixture at `a_net` = 0.5 from Julia: the second rise must be
+1.5× the first, which pins the aging law to R (not C), as `CauerStep` does for
+`CauerNetwork`.
+"""
+component JunctionStepTest
+  "Constant heat into the junction"
+  parameter P_in::Power = 2.0
+  "Pinned case temperature, also the junction's start"
+  parameter T_case::Temperature = 400.0
+  "Aging state passed to the stage"
+  parameter a_net::Real = 0.0
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_in)
+  jc = JunctionStage(T0 = T_case, a = a_net)
+  sink = ThermalComponents.Sources.FixedTemperature(T = T_case)
+relations
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, sink.port)
+end
+
+"Heat step into the junction stage against a pinned case: settles at T_case + P_in·R_jc·(1 + a_net)."
+analysis JunctionStep
+  extends TransientAnalysis(stop = 0.5, abstol = 1e-10, reltol = 1e-10)
+  model = JunctionStepTest()
+end
+
+"""
+`StageAModel` over test 30's s1 at its 2N-fixture case-side parameters, used only by
+`test/stageA_model.jl` for the energy balance and the plumbing control (a comparison with an
+independent reference integrator of the same case side).
+
+- Case side: test 30's 2N-fixture fit in the case-side structure comparison (C 1.98173 J/K,
+  Gc 0.0094014 W/K^1.25, R_cf 42.2109 K/W, C_f 1.10890 J/K).
+- `C_die` = 1e-4 J/K makes the junction stage transparent (τ_j ≈ 0.3 ms), so the thermal path
+  is the 2N-fixture structure exactly — a larger plumbing-control gap then points at the input
+  series, the initial conditions or the equations, not at the junction stage.
+- `T_start` = `T_amb` = 298.596 K: s1's first measured T_c. `stop` = 1741.008 s: the s1 end.
+- The burst edges enter as `tstops`.
+"""
+analysis StageATest30
+  extends TransientAnalysis(stop = 1741.008, abstol = 1e-8, reltol = 1e-8, tstops = PowerElectronics.stageA_tstops(30))
+  model = StageAModel(C_die = 1e-4, C = 1.9817297999882928, Gc = 0.009401386147471817, R_cf = 42.21091872296592, C_f = 1.1088981194041447, T_start = 298.596, T_amb = 298.596)
+end
+
+"""
+Test 30's case side calibrated on T_c of s1: the Stage A case-side fit in pure Dyad. The
+per-device sweep of Stage A ran through the Julia API instead (per-output losses, the 600 s
+hold-out, cool-down scoring and `:log` transforms are not expressible here).
+
+- **In-window artefact:** the analysis fits all of s1 — `stop` must span every data row (the
+  loss asserts one solution row per data row), so the 600 s hold-out split lives only in the
+  sweep. Label any number from this analysis "in-window".
+- The search space is the four **leaf** case-side parameters, with the bounds of the
+  case-side structure comparison; the Dyad level has no `:log` transform and no starting
+  values, and its gradient path falls back to a gradient-free optimizer — further reasons
+  the sweep uses the Julia API.
+- No `tstops` argument exists on CalibrationAnalysis, so `dtmax` = 0.2 s keeps the solver
+  from stepping over whole bursts (the closest edges are 35 ms apart; test 30's shortest
+  burst is ~1 s).
+- Junction stage at the first-pass estimate (C_die = 1e-3, R_jc = 3.1), as in the sweep.
+"""
+analysis StageACase30
+  extends DyadModelOptimizer.CalibrationAnalysis(
+    data = DyadData.DyadTimeseries("dyad://PowerElectronics/stageA/test30_s1.csv", independent_var = "time", dependent_vars = ["T_c"]),
+    depvars_names = ["T_c"],
+    search_space_names = ["case_node.C", "to_amb.Gc", "r_cf.R", "side.C"],
+    search_space_lb = [0.05, 1e-4, 0.5, 0.05],
+    search_space_ub = [5.0, 5e-2, 500.0, 50.0],
+    calibration_alg = DyadModelOptimizer.CalibrationAlg.SingleShooting(),
+    optimizer_maxiters = 300,
+    stop = 1741.008, abstol = 1e-6, reltol = 1e-6, dtmax = 0.2)
+  model = StageAModel(C_die = 0.001, R_jc = 3.1, T_start = 298.596, T_amb = 298.596)
+end

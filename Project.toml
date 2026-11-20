@@ -1,0 +1,59 @@
+name = "PowerElectronics"
+uuid = "e2553e5c-043d-41ee-a05f-3599b0acca17"
+version = "0.1.0"
+authors = [
+  "Venkateshprasad Bhat"
+]
+
+[deps]
+BlockComponents = "1ef5d832-be8e-447f-9f2c-8b5d17d15fd3"
+DyadData = "cab12561-e36c-4498-ae70-c9a5e79fef2a"
+DyadInterface = "99806f68-afab-45ca-9d8c-ceff6bc61f54"
+DyadModelOptimizer = "acf28c5d-e0b8-43c8-8344-4f4fed009f51"
+ElectricalComponents = "3fc4c519-469d-4ff5-98c9-d4d06b1514a2"
+Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+OrdinaryDiffEqDefault = "50262376-6c5a-4cf5-baba-aaf4f84d72d7"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+RotationalComponents = "824fa3ed-d7dc-4365-8bdf-ac77a1ac2011"
+RuntimeGeneratedFunctions = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
+ThermalComponents = "084a29d9-4f48-4925-95b4-b7d4c79725f4"
+TranslationalComponents = "42acc370-819b-4877-bdd6-eb3294461f5d"
+
+[compat]
+BlockComponents = "=5.0.0"
+DyadData = "2.0.1"
+DyadModelOptimizer = "=15.5.1"
+ElectricalComponents = "=3.0.0"
+Markdown = "1"
+OrdinaryDiffEqTsit5 = "2.1"
+Random = "1.11.0"
+RotationalComponents = "=3.0.0"
+Statistics = "1.11.5"
+Test = "1.11.0"
+ThermalComponents = "=3.0.0"
+TranslationalComponents = "=3.0.0"
+
+[dyad]
+kernel = "3.5.1"
+
+[extras]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DyadEcosystemDependencies = "7bc808db-8006-421e-b546-062440d520b7"
+OrdinaryDiffEqTsit5 = "b1df2697-797e-41e3-8120-5422d3b24e4a"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = [
+  "DyadEcosystemDependencies",
+  "CSV",
+  "DataFrames",
+  "OrdinaryDiffEqTsit5",
+  "Plots",
+  "Statistics",
+  "Test"
+]

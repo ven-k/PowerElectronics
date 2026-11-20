@@ -1,0 +1,36 @@
+"""
+Aging state a(t) of a device, without a growth law.
+
+A partial component. It holds the state `a`, its start value `a_start`, and the junction temperature `T_j` that a
+growth law may read. It contains no law, because no drift law passed validation. Extend it and add
+one relation, `der(a) = f(a, T_j)`:
+
+```
+component MyAging
+  extends AgingState
+  parameter k::Real = 1e-6
+relations
+  der(a) = k * (a + 0.004)
+end
+```
+
+Wiring:
+- `T_j`: the output of a `ThermalComponents.Sensors.TemperatureSensor` on the junction heat port.
+- `a` to the input `a_in` of a `CauerNetwork` or `JunctionStage` built with `aging_input = true`, where it is
+  dimensionless. In a `CauerNetwork` it scales the first stage only, R_eff[1] = R_th[1]·(1 + a); in a `JunctionStage`
+  it scales the stage's resistance, R_jc·(1 + a).
+- `a` through a gain to the input `ΔR_in` of a `ConductionMOSFET` built with `aging_input = true`, where it adds to
+  the on-state resistance in Ω. One state can drive both inputs.
+
+Default value and source: `a_start` 0, a pristine device.
+"""
+partial component AgingState
+  "Junction temperature read by the growth law (signal, kelvin)"
+  T_j = RealInput()
+  "Aging state"
+  a = RealOutput()
+  "Aging state at t = 0"
+  parameter a_start::Real = 0.0
+relations
+  initial a = a_start
+end

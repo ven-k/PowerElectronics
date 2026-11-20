@@ -1,0 +1,22 @@
+"""
+Periodic rectangular signal (PWM gate command).
+
+Output is `offset + amplitude` during the first `duty` fraction of each period `1 / frequency`, and `offset` otherwise,
+starting at `start_time`. The NASA rig drives the gate at 1 kHz with 40 % duty.
+
+Default values and sources:
+- `frequency` 1 kHz, `duty` 0.4: the rig's gate drive.
+- `amplitude` 10 V: the gate-source voltage at which the IRF520N datasheet rates R_DS(on); it is
+  above the 4 V threshold of `ConductionMOSFET`.
+"""
+component PWMSource
+  extends BlockComponents.Interfaces.Signal
+  "High level above offset"
+  parameter amplitude::Real = 10.0
+  "Switching frequency"
+  parameter frequency::Frequency = 1000.0
+  "Fraction of each period at the high level"
+  parameter duty::Real = 0.4
+relations
+  y = offset + ifelse(time >= start_time, ifelse(frequency * (time - start_time) - floor(frequency * (time - start_time)) < duty, amplitude, 0.0), 0.0)
+end

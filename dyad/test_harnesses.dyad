@@ -1,0 +1,570 @@
+"""
+Unit fixture for `ConductionMOSFET`: every term of the channel law, at a pinned junction temperature.
+
+Circuit: ideal supply directly across the channel (no load resistor), so `v = V_sup` exactly in both gate
+states, and every current this fixture produces is the channel law alone — not a voltage divider that a wrong
+`R_on` could hide inside. `FixedTemperature` pins the junction at `T_j_fix`, removing the electro-thermal
+feedback loop, so the expected on-resistance is a hand calculation:
+
+```math
+R_{on} = R₀ (1 + α₁ ΔT_j + α₂ ΔT_j²) + ΔR, \qquad ΔT_j = T_{j,fix} − T_{ref}
+```
+
+The MOSFET here has α₂ and ΔR nonzero. The rigs (`rig.dyad`) leave both at 0, so the system-level tests in
+test/physics.jl never exercise them: this fixture is the only place a sign or scaling error in the quadratic
+temperature term or the aging increment can surface before Stage A starts fitting them. The gate steps at
+`t_on` through a 5 ms first-order lag — the lag is the fixture's one differential state (the rest is
+algebraic) and carries the gate continuously through `V_th` the way a real gate driver's slew would.
+
+How to read the results: off-state current must equal `G_off·V_sup` exactly (not merely "small" — a small
+number would also pass if the off branch leaked through a wrong conductance), on-state current must equal
+`V_sup/R_on` with `R_on` computed from the parameters by hand, `P_loss` must equal `v·i`, and
+`junction.Q_flow` must equal `−P_loss` (heat *leaves* the die into the port). Agreement to solver tolerance
+means each piece of the component is individually right; disagreement in exactly one check points at that
+term (e.g. heat check fails, currents pass → the Q_flow sign convention is wrong, not the law).
+"""
+component MOSFETConductionTest
+  "Supply voltage across the channel (signal, volts)"
+  parameter V_sup::Real = 5.0
+  "Pinned junction temperature: ΔT_j = 100 K against the default T_ref = 298.15 K"
+  parameter T_j_fix::Temperature = 398.15
+  "Gate step time"
+  parameter t_on::Time = 0.5
+  "Gate-driver lag: the fixture's only state, and a continuous path through V_th"
+  parameter τ_gate::Time = 5e-3
+  supply_level = BlockComponents.Sources.Constant(k = V_sup)
+  supply = ElectricalComponents.Analog.Sources.VoltageSource()
+  mosfet = ConductionMOSFET(R₀ = 0.18, α₁ = 0.0117, α₂ = 2e-5, ΔR = 0.05, V_th = 4.0, G_off = 1e-6)
+  ground = ElectricalComponents.Analog.Basic.Ground()
+  gate_step = BlockComponents.Sources.Step(height = 10.0, start_time = t_on)
+  gate_lag = BlockComponents.Continuous.FirstOrder(T = τ_gate)
+  die_T = ThermalComponents.Sources.FixedTemperature(T = T_j_fix)
+relations
+  # The gate driver starts resting at 0 V (gate low): the lag state is the fixture's one differential state
+  initial gate_lag.x = 0.0
+  connect(supply_level.y, supply.V)
+  connect(supply.p, mosfet.p)
+  connect(mosfet.n, ground.g)
+  connect(supply.n, ground.g)
+  connect(gate_step.y, gate_lag.u)
+  connect(gate_lag.y, mosfet.gate)
+  connect(mosfet.junction, die_T.port)
+end
+
+"Off-state before t = 0.5 s, on-state after: both operating points of the channel law in one run."
+analysis MOSFETConduction
+  extends TransientAnalysis(stop = 1.0, dtmax = 1e-3)
+  model = MOSFETConductionTest()
+end
+
+"""
+Unit fixture for `CauerNetwork`: constant heat into `port_j`, fixed temperature at `port_c`.
+
+With a constant heat flow `P_in` and the case side pinned at `T_sink`, the network's steady state is a hand
+calculation from the ladder alone: the drop across stage 1 is `P_in·R_th[1]·(1 + a)` and the drop across stage 2 is
+`P_in·R_th[2]`, so
+
+```math
+T_1(∞) = T_{sink} + P_{in}\,\bigl((1+a)\,R_{th,1} + R_{th,2}\bigr), \qquad T_2(∞) = T_{sink} + P_{in}\,R_{th,2}
+```
+
+The aging parameter `a` enters only through this fixture's `a_net`, and Stage A's drift model rests
+on `R_eff[1] = R_th[1]·(1 + a)` being implemented exactly, with stage 2 left as it is.
+Run once with `a_net = 0` and once with `a_net = 0.5`. At the fixture's values the rises are 2·(1.0 + 2.1) = 6.2 K and
+2·2.1 = 4.2 K at `a_net = 0`, and 2·(1.5·1.0 + 2.1) = 7.2 K and 2·2.1 = 4.2 K at `a_net = 0.5`. If the second node
+moves with `a_net`, the aging acts on stage 2 as well (both stages scaled give 9.3 K and 6.3 K); if the first node
+rises by anything but `P_in·a·R_th[1]` = 1.0 K, the aging law is scaled or placed wrongly (e.g. applied to C instead
+of R).
+
+How to read the results: (i) both node temperatures start at `T₀` — the initialization contract Stage A's
+warm-start depends on; (ii) the steady drops match the ladder sums above — Kirchhoff on the thermal ladder;
+(iii) the integral balance ∫port_j.Q_flow + ∫port_c.Q_flow = Σ C_th[k]·(T_k(end) − T₀) — first law across the
+component boundary, including both port sign conventions (flow positive *into* the network on both ports).
+The balance check is the one that catches a lost or doubled `Q_flow` term, which the steady-state check
+cannot see because steady state only constrains ratios of flows, not their bookkeeping.
+"""
+component CauerStepTest
+  "Constant heat into the junction port"
+  parameter P_in::Power = 2.0
+  "Pinned case-side temperature, also the network's initial temperature"
+  parameter T_sink::Temperature = 300.0
+  "Aging state passed to the network (R_eff[1] = R_th[1]·(1 + a))"
+  parameter a_net::Real = 0.0
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_in)
+  jc = CauerNetwork(T₀ = T_sink, a = a_net, R_th = [1.0, 2.1], C_th = [0.005, 0.2])
+  sink = ThermalComponents.Sources.FixedTemperature(T = T_sink)
+relations
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, sink.port)
+end
+
+"Heat-step response of a 2-stage ladder at the fixture's test values (R_th 1.0 and 2.1 K/W, C_th 0.005 and 0.2 J/K); 30 s ≈ 50 slow time constants, so the end is steady."
+analysis CauerStep
+  extends TransientAnalysis(stop = 30.0)
+  model = CauerStepTest()
+end
+
+"""
+`CauerStepTest` with the aging state on the signal input `a_in` of `CauerNetwork(aging_input = true)`, held at
+`a_net` by a constant source. Every other value equals `CauerStepTest`, so the two fixtures must give the same
+solution: the signal input acts on the ladder exactly as the parameter `a` does. Used by `test/aging.jl`.
+"""
+component CauerStepInputTest
+  "Constant heat into the junction port"
+  parameter P_in::Power = 2.0
+  "Pinned case-side temperature, also the network's initial temperature"
+  parameter T_sink::Temperature = 300.0
+  "Aging state held on the network's signal input"
+  parameter a_net::Real = 0.0
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_in)
+  jc = CauerNetwork(aging_input = true, T₀ = T_sink, R_th = [1.0, 2.1], C_th = [0.005, 0.2])
+  sink = ThermalComponents.Sources.FixedTemperature(T = T_sink)
+  a_level = BlockComponents.Sources.Constant(k = a_net)
+relations
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, sink.port)
+  connect(a_level.y, jc.a_in)
+end
+
+"Heat-step response of `CauerStepInputTest`, with the settings of `CauerStep`."
+analysis CauerStepInput
+  extends TransientAnalysis(stop = 30.0)
+  model = CauerStepInputTest()
+end
+
+"""
+`MOSFETConductionTest` with the aging increment on the signal input `ΔR_in` of
+`ConductionMOSFET(aging_input = true)`, held at 0.05 Ω by a constant source. Every other value equals
+`MOSFETConductionTest`, so the two fixtures must give the same solution: the signal input adds to the on-state
+resistance exactly as the parameter `ΔR` does. Used by `test/aging.jl`.
+"""
+component MOSFETConductionInputTest
+  "Supply voltage across the channel (signal, volts)"
+  parameter V_sup::Real = 5.0
+  "Pinned junction temperature: ΔT_j = 100 K against the default T_ref = 298.15 K"
+  parameter T_j_fix::Temperature = 398.15
+  "Gate step time"
+  parameter t_on::Time = 0.5
+  "Gate-driver lag"
+  parameter τ_gate::Time = 5e-3
+  "Aging increment held on the channel's signal input"
+  parameter ΔR_net::Resistance = 0.05
+  supply_level = BlockComponents.Sources.Constant(k = V_sup)
+  supply = ElectricalComponents.Analog.Sources.VoltageSource()
+  mosfet = ConductionMOSFET(aging_input = true, R₀ = 0.18, α₁ = 0.0117, α₂ = 2e-5, V_th = 4.0, G_off = 1e-6)
+  ground = ElectricalComponents.Analog.Basic.Ground()
+  gate_step = BlockComponents.Sources.Step(height = 10.0, start_time = t_on)
+  gate_lag = BlockComponents.Continuous.FirstOrder(T = τ_gate)
+  die_T = ThermalComponents.Sources.FixedTemperature(T = T_j_fix)
+  ΔR_level = BlockComponents.Sources.Constant(k = ΔR_net)
+relations
+  initial gate_lag.x = 0.0
+  connect(supply_level.y, supply.V)
+  connect(supply.p, mosfet.p)
+  connect(mosfet.n, ground.g)
+  connect(supply.n, ground.g)
+  connect(gate_step.y, gate_lag.u)
+  connect(gate_lag.y, mosfet.gate)
+  connect(mosfet.junction, die_T.port)
+  connect(ΔR_level.y, mosfet.ΔR_in)
+end
+
+"Both operating points of `MOSFETConductionInputTest`, with the settings of `MOSFETConduction`."
+analysis MOSFETConductionInput
+  extends TransientAnalysis(stop = 1.0, dtmax = 1e-3)
+  model = MOSFETConductionInputTest()
+end
+
+"""
+`JunctionStepTest` with the aging state on the signal input `a_in` of `JunctionStage(aging_input = true)`, held at
+`a_net` by a constant source. Every other value equals `JunctionStepTest`, so the two fixtures must give the same
+solution: the signal input acts on R_jc exactly as the parameter `a` does. Used by `test/aging.jl`.
+"""
+component JunctionStepInputTest
+  "Constant heat into the junction"
+  parameter P_in::Power = 2.0
+  "Pinned case temperature, also the junction's start"
+  parameter T_case::Temperature = 400.0
+  "Aging state held on the stage's signal input"
+  parameter a_net::Real = 0.0
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_in)
+  jc = JunctionStage(aging_input = true, T0 = T_case)
+  sink = ThermalComponents.Sources.FixedTemperature(T = T_case)
+  a_level = BlockComponents.Sources.Constant(k = a_net)
+relations
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, sink.port)
+  connect(a_level.y, jc.a_in)
+end
+
+"Heat step of `JunctionStepInputTest`, with the settings of `JunctionStep`."
+analysis JunctionStepInput
+  extends TransientAnalysis(stop = 0.5, abstol = 1e-10, reltol = 1e-10)
+  model = JunctionStepInputTest()
+end
+
+"""
+Test law for `AgingState`, used only by `AgingClosedFormTest`: exponential growth with an Arrhenius factor,
+
+```math
+\frac{da}{dt} = κ \, e^{−θ (1/T_j − 1/T_{law})} \, (a + a_s)
+```
+
+At constant `T_j` it has the closed form `a(t) = (a_start + a_s)·exp(κ_T·t) − a_s` with
+`κ_T = κ·exp(−θ·(1/T_j − 1/T_law))`. It is not a validated drift law, and its values are test values, not data.
+"""
+component AgingLawTest
+  extends AgingState
+  "Growth rate at T_law (1/s)"
+  parameter κ::Real = 0.005
+  "Offset of the growth term"
+  parameter a_s::Real = 0.004
+  "Arrhenius temperature E/k_B (K)"
+  parameter θ::Real = 5000.0
+  "Temperature at which the growth rate is κ"
+  parameter T_law::Temperature = 400.0
+relations
+  der(a) = κ * exp(-θ * (1 / T_j - 1 / T_law)) * (a + a_s)
+end
+
+"""
+Fixture for an aging state that changes during a simulation: `AgingLawTest` drives the signal input `a_in` of a
+`JunctionStage` under a constant heat step with the case pinned.
+
+The law reads the pinned case temperature `T_case` through a temperature sensor, so its temperature is constant and
+its closed form is exact (see `AgingLawTest`); at `T_case` = 450 K and `T_law` = 400 K the Arrhenius factor is 4.01,
+so a law that did not receive the temperature would grow at a quarter of the expected rate. The stage must carry
+the heat flow `Q = (T_j − T_case)/(R_jc·(1 + a))` at every instant with the present `a`. Used by `test/aging.jl`.
+"""
+component AgingClosedFormTest
+  "Constant heat into the junction"
+  parameter P_in::Power = 2.0
+  "Pinned case temperature: the junction's start and the temperature the law reads"
+  parameter T_case::Temperature = 450.0
+  "Aging state at t = 0"
+  parameter a_start::Real = 0.1
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_in)
+  jc = JunctionStage(aging_input = true, T0 = T_case)
+  sink = ThermalComponents.Sources.FixedTemperature(T = T_case)
+  sensor = ThermalComponents.Sensors.TemperatureSensor()
+  law = AgingLawTest(a_start = a_start)
+relations
+  connect(heat.port, jc.port_j)
+  connect(jc.port_c, sink.port)
+  connect(sensor.port, sink.port)
+  connect(sensor.T, law.T_j)
+  connect(law.a, jc.a_in)
+end
+
+"Growth of the aging state over 100 s under `AgingLawTest`, from 0.1 to 0.77."
+analysis AgingClosedForm
+  extends TransientAnalysis(stop = 100.0, abstol = 1e-10, reltol = 1e-10)
+  model = AgingClosedFormTest()
+end
+
+"""
+Unit fixture for `DutyAveragedHeat`: the cycle-averaging operator's contract, isolated.
+
+A fixed `P_dev` enters `port_device`; `port_network` feeds a bare heat capacitor with no loss path. The
+capacitor then integrates exactly what the operator passes, so its temperature must be the straight line
+
+```math
+T(t) = T_{start} + \frac{duty · P_{dev}}{C_{sink}}\, t
+```
+
+with no curvature and no other admissible slope. Any deviation from `duty·P_dev` — the full `P_dev`, a sign
+flip, a missing minus in `port_network.Q_flow = −duty·port_device.Q_flow` — shows up as the wrong slope.
+
+How to read the results: this component is *deliberately non-conservative* — `(1 − duty)·P_dev` vanishes by
+design, because it models the cycle average of a switched device whose off-time dissipation is zero while the
+electrical side is held at the on-state operating point (see the component docstring). So the test must NOT
+assert port-to-port energy conservation; it asserts the operator contract instead: network heat = duty ×
+device heat, equal port temperatures (`port_device.T = port_network.T`), and — run with `duty_k = 0` — a
+capacitor that stays at `T_start` exactly, which is the path the rig's hysteresis controller uses to switch
+the rig's heat off.
+"""
+component DutyAveragingTest
+  "On-state device heat entering the operator"
+  parameter P_dev::Power = 10.0
+  "Duty fed to the operator (constant for the test)"
+  parameter duty_k::Real = 0.4
+  "Heat capacity integrating the averaged output"
+  parameter C_sink::HeatCapacity = 2.0
+  "Initial capacitor temperature"
+  parameter T_start::Temperature = 300.0
+  heat = ThermalComponents.Sources.FixedHeatFlow(Q_flow = P_dev)
+  averaging = DutyAveragedHeat()
+  duty_level = BlockComponents.Sources.Constant(k = duty_k)
+  store = ThermalComponents.Components.HeatCapacitor(C = C_sink, T0 = T_start)
+relations
+  connect(heat.port, averaging.port_device)
+  connect(duty_level.y, averaging.duty)
+  connect(averaging.port_network, store.port)
+end
+
+"Averaged heat into a lossless capacitor: T(t) must be the line T_start + duty·P_dev/C_sink · t."
+analysis DutyAveraging
+  extends TransientAnalysis(stop = 5.0)
+  model = DutyAveragingTest()
+end
+
+"""
+Unit fixture for `PWMSource`: levels, timing, and duty fraction of the gate command.
+
+The source drives an integrator (`x0 = 0`), which turns the duty fraction into a single number that does not
+depend on where individual samples land:
+
+```math
+∫_0^{t_{stop}} y\,dt = offset·t_{stop} + amplitude·duty·(t_{stop} − t_{start})
+```
+
+exact whenever `t_stop − t_start` is a whole number of periods (here 10 periods of 0.1 s). The parameters are
+deliberately asymmetric — `offset = 0.5`, `start_time = 0.05`, `duty = 0.3` — so that a source ignoring any
+one of them produces a visibly different integral; the rig's defaults (`offset = 0`, `start_time = 0`) would
+mask exactly those two failure modes.
+
+How to read the results: the level checks (sampled mid-high and mid-low in several different periods, away
+from the edges) verify the waveform shape and that the phase does not drift over 10 periods — a wrong
+`floor` construction accumulates phase error that grows with period count, which single-period checks miss.
+The integral check verifies the duty *fraction* itself, which is what the thermal model consumes (heat scales
+with duty): a few-percent duty error would pass every level check but shift every Stage A heat input. The
+edge cases `duty = 0` and `duty = 1` pin the boundary arithmetic of `frac < duty`, where an `<` vs `<=`
+mistake flips the whole output.
+"""
+component PWMSourceTest
+  "Duty fed to the source (overridden to 0 and 1 for the boundary checks)"
+  parameter pwm_duty::Real = 0.3
+  pwm = PWMSource(amplitude = 2.0, frequency = 10.0, duty = pwm_duty, offset = 0.5, start_time = 0.05)
+  intg = BlockComponents.Continuous.Integrator()
+relations
+  connect(pwm.y, intg.u)
+end
+
+"10 full PWM periods plus the pre-start interval; dtmax well below the edge spacing so no edge is stepped over."
+analysis PWMWindow
+  extends TransientAnalysis(stop = 1.05, dtmax = 2e-4)
+  model = PWMSourceTest()
+end
+
+"""
+Unit fixture for `CurrentOffset`: a current ramp through the offset block into an
+integrator.
+
+The block is algebraic, so the check is exact at every instant: `meas.y − ramp.y = offset_I`, independent
+of the input level. The ramp runs from the off state (0 A) to about the rig's cold on-state current (5.61 V
+across R_load 0.2 Ω plus R0 0.158 Ω gives 15.7 A), so a level-dependent error (a gain instead of an offset)
+shows up as a drift of the difference along the ramp. The integrator adds the fixture's one differential
+state and a second, integral check: ∫y dt = ∫u dt + offset_I·t.
+
+How to read the results: test/observation.jl runs it at `off_I` = 0 (transparent) and 0.3 A (inside the
+0.2–0.4 A zero offset seen in the data), with the ramp corners in `tstops`.
+"""
+component CurrentOffsetTest
+  "Offset under test (A): 0.3 A lies in the 0.2–0.4 A range seen in the data"
+  parameter off_I::Current = 0.3
+  ramp = BlockComponents.Sources.Ramp(offset = 0.0, height = 15.0, duration = 0.8, start_time = 0.1)
+  meas = CurrentOffset(offset_I = off_I)
+  intg = BlockComponents.Continuous.Integrator()
+relations
+  connect(ramp.y, meas.u)
+  connect(meas.y, intg.u)
+end
+
+"CurrentOffset on a 0 → 15 A ramp; the corners at 0.1 s and 0.9 s are the only non-smooth points."
+analysis CurrentOffsetRamp
+  extends TransientAnalysis(stop = 1.0, dtmax = 1e-3)
+  model = CurrentOffsetTest()
+end
+
+"""
+Unit fixture for `VdsStepArtefact`, tests (i) and (ii): one turn-on step of V_ds.
+
+V_ds rests at the off-state level `U0` (the rig's supply, 5.61 V) and steps by `dU` at `t_step` to the cold
+on-state level (2.5 V: 15.7 A through R0 0.158 Ω). The filter state starts at `U0`, so before the step the
+output must equal the input exactly (gain 1 at constant input, test ii). After the step the error is the
+hand calculation
+
+```math
+e(t) = k_V\,ΔU\,e^{−(t − t_{step})/τ_V}
+```
+
+(test i). `k_test` = 0.05 is a test value, not a calibration: large enough that e is far above solver noise.
+`off_V` adds the static offset for the rerun at 0.09 V.
+
+How to read the results: test/observation.jl builds the fixture from Julia so the step edge goes into
+`tstops`. A wrong jump height points at k_V or the sign of (u − x); a wrong decay rate at τ_V.
+"""
+component VdsArtefactStepTest
+  "Overshoot gain (test value, not a calibration)"
+  parameter k_test::Real = 0.05
+  "Static channel offset (V); 0 here, 0.09 V in the rerun"
+  parameter off_V::Voltage = 0.0
+  "V_ds before the step (V): off state, V_ds = V_sup = 5.61 V (ControlledAveragedRig)"
+  parameter U0::Voltage = 5.61
+  "Step of V_ds (V): turn-on to the cold on-state level 2.5 V"
+  parameter dU::Voltage = -3.11
+  "Step time (s)"
+  parameter t_step::Time = 2e-4
+  vds = BlockComponents.Sources.Step(height = dU, offset = U0, start_time = t_step)
+  art = VdsStepArtefact(k_V = k_test, offset_V = off_V, x_start = U0)
+relations
+  connect(vds.y, art.u)
+end
+
+"One V_ds step; 800 µs after the edge is about 11 τ_V."
+analysis VdsArtefactStep
+  extends TransientAnalysis(stop = 1e-3, dtmax = 1e-6)
+  model = VdsArtefactStepTest()
+end
+
+"""
+Unit fixture for `VdsStepArtefact`, test (iii): the NASA gate drive, a 1 kHz pulse
+train with 40 % duty (`PWMSource`), between the off-state level `V_off` and the on-state level
+`V_on`.
+
+In the periodic steady state the error just after each turn-on edge is
+
+```math
+z_0 = a\,\frac{1 − e^{−T_{off}/τ_V}}{1 − e^{−T/τ_V}}, \qquad a = V_{on} − V_{off}
+```
+
+and e = k_V·z_0·exp(−s/τ_V) at time s into the on-run, so the mean error over a window [f₁, f₂] of the
+on-run of length T_on is k_V·z_0·τ_V·(e^{−f₁T_on/τ_V} − e^{−f₂T_on/τ_V})/((f₂ − f₁)T_on). The two windows are
+the data export's `vds_early` (20–30 % of the on-run) and `vds_on` (78–98 %).
+
+How to read the results: the start transient decays by e^{−T/τ_V} ≈ 6e-7 per period, so period 6 is in the
+periodic steady state to well below the 1e-6 bar.
+"""
+component VdsArtefactPWMTest
+  "Overshoot gain (test value, not a calibration)"
+  parameter k_test::Real = 0.05
+  "Off-state V_ds (V): V_sup = 5.61 V (ControlledAveragedRig)"
+  parameter V_off::Voltage = 5.61
+  "On-state V_ds (V): cold on-state level, 15.7 A through R0 0.158 Ω"
+  parameter V_on::Voltage = 2.5
+  gate = PWMSource(amplitude = V_on - V_off, offset = V_off, frequency = 1000.0, duty = 0.4)
+  art = VdsStepArtefact(k_V = k_test, x_start = V_off)
+relations
+  connect(gate.y, art.u)
+end
+
+"Six 1 ms gate periods; the edges are 0.4 ms and 0.6 ms apart."
+analysis VdsArtefactPWM
+  extends TransientAnalysis(stop = 6e-3, dtmax = 2e-6)
+  model = VdsArtefactPWMTest()
+end
+
+"""
+Unit fixture for `ThermocoupleLag`: step response.
+
+The input rests at `T0` (483.15 K, test 30's 210 °C hold band) and steps by `dT` at `t_step`; the reading
+starts at `T0`. Expected: T_meas = T0 before the step and
+
+```math
+T_{meas}(t) = T_0 + dT\,(1 − e^{−(t − t_{step})/τ_{tc}})
+```
+
+after it. `tau` = 0.37 s (the top of the fitted bead lags, 0.05–0.37 s) differs from 1 on purpose: at
+τ = 1 s a missing division by τ_tc would pass.
+"""
+component LagStepTest
+  "Bead time constant under test (s): 0.37 s, the top of the fitted bead lags, 0.05–0.37 s"
+  parameter tau::Time = 0.37
+  "Input before the step and start of the reading (K): 483.15 K, test 30's hold band"
+  parameter T0::Temperature = 483.15
+  "Step height (K)"
+  parameter dT::Temperature = 10.0
+  "Step time (s)"
+  parameter t_step::Time = 1.0
+  src = BlockComponents.Sources.Step(height = dT, offset = T0, start_time = t_step)
+  lag = ThermocoupleLag(τ_tc = tau, T_start = T0)
+relations
+  connect(src.y, lag.u)
+end
+
+"Temperature step at 1 s; 4 s after the edge is about 11 τ_tc."
+analysis LagStep
+  extends TransientAnalysis(stop = 5.0, dtmax = 0.01)
+  model = LagStepTest()
+end
+
+"""
+Unit fixture for `ThermocoupleLag`: sine response at test 30's measured burst
+period, 4.85 s (see `Rig30`).
+
+For T = T_mean + A·sin(ωt) the periodic response is T_mean + A·r·sin(ωt − φ) with
+r = 1/√(1 + (ωτ_tc)²) and φ = atan(ωτ_tc); the start transient decays as e^{−t/τ_tc}. The mean of T_meas
+over whole periods equals T_mean (unit gain at zero frequency). A = 3 K is about half the measured hold
+ripple (p2–p98 5.67 °C over test 30's last setpoint).
+
+How to read the results: test/observation.jl projects T_meas on sin and cos over periods 11–20, where the
+transient is below e^{−48}.
+"""
+component LagSineTest
+  "Bead time constant under test (s): the block default, 1.0 s"
+  parameter tau::Time = 1.0
+  "Mean temperature (K): test 30's hold band"
+  parameter T_mean::Temperature = 483.15
+  "Sine amplitude (K)"
+  parameter A::Temperature = 3.0
+  "Sine period (s): test 30's measured burst period"
+  parameter period::Time = 4.85
+  src = BlockComponents.Sources.Sine(amplitude = A, frequency = 1 / period, offset = T_mean)
+  lag = ThermocoupleLag(τ_tc = tau, T_start = T_mean)
+relations
+  connect(src.y, lag.u)
+end
+
+"Twenty periods of 4.85 s at tight tolerances; the test reads periods 11–20."
+analysis LagSine
+  extends TransientAnalysis(stop = 97.0, abstol = 1e-10, reltol = 1e-10)
+  model = LagSineTest()
+end
+
+"""
+Unit fixture for `ThermocoupleLag`: the block does not load the network it reads.
+
+Two identical thermal nodes (C_node, cooling through R_node to T_amb from T_hot) are simulated in one
+solve. Node a is read by a `TemperatureSensor` feeding the lag; node b has nothing attached. Both must
+follow the same exponential T_amb + (T_hot − T_amb)·e^{−t/(R·C)}, and the two node temperatures must be
+identical. The lag's reading of that exponential, starting at T_hot, is the hand calculation
+
+```math
+T_{meas} = T_{amb} + ΔT\,\frac{τ_{th}\,e^{−t/τ_{th}} − τ_{tc}\,e^{−t/τ_{tc}}}{τ_{th} − τ_{tc}}, \qquad τ_{th} = R_{node} C_{node}
+```
+
+C_node is test 30's case-node capacity (1.6959 J/K, as in ControlledAveragedRig).
+"""
+component LagTwinTest
+  "Bead time constant under test (s)"
+  parameter tau::Time = 1.0
+  "Node heat capacity (J/K): test 30's case node"
+  parameter C_node::HeatCapacity = 1.6959
+  "Node-to-ambient resistance (K/W): τ_th = 17 s, well apart from τ_tc"
+  parameter R_node::ThermalResistance = 10.0
+  "Start temperature of both nodes and of the reading (K): test 30's hold band"
+  parameter T_hot::Temperature = 483.15
+  "Ambient (K): T_amb of ControlledAveragedRig"
+  parameter T_amb::Temperature = 298.6
+  node_a = ThermalComponents.Components.HeatCapacitor(C = C_node, T0 = T_hot)
+  r_a = ThermalComponents.Components.ThermalResistor(R = R_node)
+  sink_a = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  node_b = ThermalComponents.Components.HeatCapacitor(C = C_node, T0 = T_hot)
+  r_b = ThermalComponents.Components.ThermalResistor(R = R_node)
+  sink_b = ThermalComponents.Sources.FixedTemperature(T = T_amb)
+  sensor = ThermalComponents.Sensors.TemperatureSensor()
+  lag = ThermocoupleLag(τ_tc = tau, T_start = T_hot)
+relations
+  connect(node_a.port, r_a.port_a)
+  connect(r_a.port_b, sink_a.port)
+  connect(node_b.port, r_b.port_a)
+  connect(r_b.port_b, sink_b.port)
+  connect(node_a.port, sensor.port)
+  connect(sensor.T, lag.u)
+end
+
+"Twin cool-downs over about 3.5 τ_th at tight tolerances."
+analysis LagTwin
+  extends TransientAnalysis(stop = 60.0, abstol = 1e-10, reltol = 1e-10)
+  model = LagTwinTest()
+end

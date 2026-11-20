@@ -1,0 +1,10 @@
+# Dyad compiler output: run `dyad compile .` (see README)
+/generated/
+/.dyadcache
+# NASA-derived input files are not distributed (see README, Data)
+/assets/
+Manifest*.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+.DS_Store
